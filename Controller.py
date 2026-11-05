@@ -60,53 +60,63 @@ def SetCommand(accelCommand: npt.NDArray, angAccelCommand: npt.NDArray) -> None:
 #############################################################################################
 
 # ==============================================================================
-# STU4 HIGH-PERFORMANCE AUTOPILOT — RADAR + OPTICAL FUSION DEBRIS AVOIDANCE
+# SPACE TEAMS STU4 - HIGH-PRECISION AUTONOMOUS GUIDANCE & SENSOR FUSION APF
 #
-# Architecture:
-#  1. BOOST to CRUISE_SPEED (13 m/s) using full 0.5 m/s^2 thrust
-#  2. Active radar debris avoidance — APF repulsion, 360° coverage
-#  3. Post-dodge course correction — velocity steering back to target bearing
-#  4. OpenCV optical contour scan for large visual threats
-#  5. Full LiveDashboard-compatible telemetry output
+# Key Features:
+# 1. Pad Liftoff & Attitude Priority:
+#    - 0.15 m/s^2 gentle liftoff while pitching up, accelerating to 0.48 m/s^2
+#      once aligned forward (< 18°), cutting off cleanly at CRUISE_SPEED.
+# 2. 2-DOF Direct LOS Attitude Control (Zero Roll Spin):
+#    - Pitch: -kp * u_body[2] - kd * w_y
+#    - Yaw:   +kp * u_body[1] - kd * w_z
+#    - Roll:  -kd_roll * w_x (zero spin)
+# 3. Enhanced Lateral APF + Radar-Optical Fusion:
+#    - Null-space lateral repulsion for collision avoidance without speed loss.
+#    - OpenCV optical contour extraction & association with radar tracks.
+# 4. Detached LiveDashboard HUD:
+#    - Streams telemetry to real-time HUD with 0.0 ms impact on 60 Hz sim loop.
 # ==============================================================================
 
 import json
 import cv2
 
-# --- Mission Parameters ---
-CRUISE_SPEED:          float = 13.0    # m/s target cruise speed
-BOOST_FUEL_LIMIT:      float = 55.0    # kg of fuel allowed for initial boost
-NOMINAL_FUEL_KG:       float = 75.0    # for scoring normalisation display
-MAX_ACCEL_CMD:         float = 0.48    # m/s^2 (leave slight margin below 0.5 limit)
-MAX_ANG_ACCEL:         float = 0.045   # rad/s^2
-KEEP_OUT_RADIUS:       float = 50.0    # m (win condition)
+# --- Mission & Guidance Parameters ---
+CRUISE_SPEED:          float = 13.00   # m/s target cruise speed
+BOOST_FUEL_LIMIT:      float = 55.00   # kg fuel limit for initial boost phase
+NOMINAL_FUEL_KG:       float = 75.00   # kg reference fuel for scoring display
+MAX_ACCEL_CMD:         float = 0.48    # m/s^2 linear acceleration limit
+MAX_ANG_ACCEL:         float = 0.045   # rad/s^2 angular acceleration limit
+KEEP_OUT_RADIUS:       float = 50.0    # m win condition radius
 
 # --- Debris Avoidance ---
-RADAR_N_CHECK:         int   = 32      # top N nearest radar contacts to check
-PROXIMITY_BUBBLE_M:    float = 22.0    # m — engage repulsion if rock surface within this
-SAFE_CLEARANCE_M:      float = 6.0     # m — extra safety buffer added to radar diameter
-CLOSING_THRESHOLD:     float = -0.05   # m/s — negative = approaching
-REPULSION_GAIN:        float = 0.40    # repulsion acceleration scalar
-COURSE_CORRECTION_KP:  float = 0.012   # P-gain for velocity-space course-correction
-COURSE_CORRECTION_KD:  float = 0.60    # D-gain (damps oscillation)
+RADAR_N_CHECK:         int   = 100      # nearest radar contacts to inspect
+PROXIMITY_BUBBLE_M:    float = 22.0    # m proximity threshold for active repulsion
+SAFE_CLEARANCE_M:      float = 6.0     # m buffer added to debris radius
+CLOSING_THRESHOLD:     float = -0.05   # m/s closing speed threshold
+REPULSION_GAIN:        float = 0.40    # lateral repulsion acceleration scalar
+COURSE_CORRECTION_KP:  float = 0.012   # P-gain for post-dodge velocity recovery
+COURSE_CORRECTION_KD:  float = 0.60    # D-gain damping
 
-# --- Optical (OpenCV) ---
-CAM_CAPTURE_INTERVAL:  int   = 8       # ticks between optical scans (60Hz → ~7Hz)
-OPT_EV:                float = 22.0
-OPT_MIN_AREA_PX:       float = 8.0     # filter noise
-OPT_OPTICAL_THREAT_AREA_PX: float = 200.0  # large contour = active threat
-OPT_CENTER_THREAT_PX:  float = 35.0    # centred contour (pixels from centre)
+# --- Optical Sensing (OpenCV) ---
+CAM_CAPTURE_INTERVAL:  int   = 8       # ticks between optical scans (~7.5 Hz at 60 Hz)
+OPT_EV:                float = 10.0    # EV 10 calibrated exposure
+OPT_MIN_AREA_PX:       float = 6.0     # min contour area in pixels
+OPT_OPTICAL_THREAT_AREA_PX: float = 120.0  # large contour threat threshold
+OPT_CENTER_THREAT_PX:  float = 30.0    # distance from optical axis
 
-# --- Attitude gains ---
+# --- Attitude Control Gains ---
 kp_point: float = 0.25
 kd_point: float = 1.00
 kd_roll:  float = 1.50
 
-# --- Telemetry ---
-TELEM_INTERVAL: int = 6   # ticks between telemetry writes
+# --- Telemetry & Dashboard Mode ---
+TELEM_INTERVAL:        int  = 6        # ticks between telemetry writes (10 Hz)
+ENABLE_DASHBOARD:      bool = True     # auto-launch dashboard window on start
+ENABLE_LIVE_DASHBOARD: bool = True     # alias for compatibility
+DASHBOARD_TYPE:        str  = "RADAR"  # Options: "TRAJECTORY" (or "PATH"), "RADAR", "LIVE"
 
 # ==============================================================================
-# Initialisation
+# Initialization
 # ==============================================================================
 PanTiltCamera(topCamera, 0.0, 0.0)
 PanTiltCamera(bottomCamera, 0.0, 0.0)
@@ -135,73 +145,117 @@ initial_dist: float = float(np.linalg.norm(target_loc - initial_shuttle_loc))
 telemetry_path = r"d:\Escape_the_Probe\telemetry.json"
 telemetry_path2 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "telemetry.json")
 
-# State variables
-boost_completed: bool = False
-win_registered:  bool = False
-iteration:       int   = 0
-exit_flag:       bool  = False
 
-# Post-dodge recovery
-dodge_active_prev: bool  = False
-recovery_counter:  int   = 0
-RECOVERY_TICKS:    int   = int(loop_freq_hz * 2.5)  # 2.5s correction window after dodge
+def LaunchDashboardIfIdle() -> None:
+    """Automatically spawn selected dashboard as a detached background process if not already open."""
+    import socket
+    import subprocess
+
+    dtype = str(globals().get("DASHBOARD_TYPE", "RADAR")).upper()
+    if dtype in ("TRAJECTORY", "PATH", "LOS"):
+        port = 49283
+        script_name = "TrajectoryDashboard.py"
+    elif dtype == "RADAR":
+        port = 49282
+        script_name = "RadarDashboard.py"
+    else:
+        port = 49281
+        script_name = "LiveDashboard.py"
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.12)
+            if s.connect_ex(("127.0.0.1", port)) == 0:
+                return  # Dashboard window is already open and running
+    except Exception:
+        pass
+
+    try:
+        # script_name determined above
+        this_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else r"d:\Escape_the_Probe"
+        dashboard_paths = [
+            os.path.join(this_dir, script_name),
+            os.path.join(r"d:\Escape_the_Probe", script_name),
+            os.path.join(r"d:\Escape_the_Probe\Repos\STU4-Solution", script_name),
+            os.path.join(r"C:\Users\usser\AppData\Local\SimDynamX\STPro\Assets\Repos\STU4-Solution", script_name)
+        ]
+        target_script = None
+        for p in dashboard_paths:
+            if os.path.exists(p):
+                target_script = p
+                break
+
+        if target_script is not None:
+            pyw_exe = sys.executable.replace("python.exe", "pythonw.exe")
+            exe = pyw_exe if os.path.exists(pyw_exe) else sys.executable
+            DETACHED_FLAGS = 0x00000008 | 0x00000200
+            subprocess.Popen([exe, target_script], creationflags=DETACHED_FLAGS, close_fds=True)
+    except Exception:
+        pass
+
+
+if globals().get("ENABLE_DASHBOARD", True) or globals().get("ENABLE_LIVE_DASHBOARD", False):
+    LaunchDashboardIfIdle()
+
+# State variables
+boost_completed:   bool = False
+win_registered:    bool = False
+iteration:         int  = 0
+exit_flag:         bool = False
+dodge_active_prev: bool = False
+recovery_counter:  int  = 0
+RECOVERY_TICKS:    int  = int(loop_freq_hz * 2.5)  # 2.5s post-dodge correction window
 
 # Optical state
 optical_contours_cache: list = []
 cam_tick: int = 0
 
-# ==============================================================================
-# Helper: OpenCV debris scan on front-facing camera
-# ==============================================================================
+cameraParams = st.CaptureImageProperties()
+cameraParams.nonphys_EV = OPT_EV
+cameraParams.FOV = 60.0
+cameraParams.ResolutionX = 128
+cameraParams.ResolutionY = 128
+
+
 def run_optical_scan() -> list:
-    """Return list of [cx_norm, cy_norm, area_px, equiv_r_px] for each contour."""
+    """Capture camera frame and return list of [cx, cy, area_px, equiv_r_px] in pixel coordinates."""
     results = []
     try:
-        PanTiltCamera(topCamera, 0.0, -10.0)   # slight downward look
-        time.sleep(0.002)
-        frame = topCamera.GetParam(st.VarType.image, ["Camera", "Image"])
-        if frame is None:
-            return results
-        img = np.array(frame, dtype=np.uint8)
-        if img.ndim == 3:
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = img
-        h, w = gray.shape
-        # Otsu threshold (auto handles both lit and dark frames)
-        otsu_thresh, _ = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        if otsu_thresh > 80 or otsu_thresh < 2:
-            # near-uniform frame → use fixed threshold
-            _, binary = cv2.threshold(gray, 25, 255, cv2.THRESH_BINARY)
-        else:
-            _, binary = cv2.threshold(gray, int(otsu_thresh), 255, cv2.THRESH_BINARY)
-        # Morphological close: fills texture cracks in rocky surfaces
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cx_centre = w / 2.0
-        cy_centre = h / 2.0
-        for cnt in contours:
-            area = float(cv2.contourArea(cnt))
-            if area < OPT_MIN_AREA_PX:
-                continue
-            M = cv2.moments(cnt)
-            if M["m00"] > 0:
-                cx_px = M["m10"] / M["m00"]
-                cy_px = M["m01"] / M["m00"]
-            else:
-                x_r, y_r, wr, hr = cv2.boundingRect(cnt)
-                cx_px = x_r + wr / 2.0
-                cy_px = y_r + hr / 2.0
-            equiv_r = float(np.sqrt(area / np.pi))
-            results.append([cx_px - cx_centre, cy_px - cy_centre, area, equiv_r])
+        image = st.camera.CaptureImageBlocking(topCamera, cameraParams)
+        if image is not None:
+            rgb8 = image.as_RGB8()
+            im_r = np.asarray(rgb8.PixelsR).reshape((128, 128))
+            im_g = np.asarray(rgb8.PixelsG).reshape((128, 128))
+            im_b = np.asarray(rgb8.PixelsB).reshape((128, 128))
+            gray = np.clip(0.299 * im_r + 0.587 * im_g + 0.114 * im_b, 0, 255).astype(np.uint8)
+
+            otsu_thresh, _ = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            thresh_val = max(15, min(int(otsu_thresh), 140))
+            _, binary = cv2.threshold(gray, thresh_val, 255, cv2.THRESH_BINARY)
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
+            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            for cnt in contours:
+                area = float(cv2.contourArea(cnt))
+                if area < OPT_MIN_AREA_PX:
+                    continue
+                M = cv2.moments(cnt)
+                if M["m00"] > 0:
+                    cx_px_val = float(M["m10"] / M["m00"])
+                    cy_px_val = float(M["m01"] / M["m00"])
+                else:
+                    xr, yr, wr, hr = cv2.boundingRect(cnt)
+                    cx_px_val = float(xr + wr / 2.0)
+                    cy_px_val = float(yr + hr / 2.0)
+                equiv_r = float(np.sqrt(area / np.pi))
+                results.append([cx_px_val, cy_px_val, area, equiv_r])
     except Exception:
         pass
     return results
 
 
 # ==============================================================================
-# Main Control Loop
+# Main Simulation Loop
 # ==============================================================================
 while not exit_flag:
     time.sleep(tick_dt)
@@ -231,34 +285,48 @@ while not exit_flag:
     except Exception:
         pass
 
-    # ---- Geometry ------------------------------------------------------------
+    # ---- Geometry & Target Vector --------------------------------------------
     to_target_vec  = target_loc - loc
     dist_to_target = float(np.linalg.norm(to_target_vec))
     unit_to_target = to_target_vec / max(dist_to_target, 1e-6)
 
-    # ---- Body-frame attitude error -------------------------------------------
+    # ---- Body-Frame Line-of-Sight Attitude Error -----------------------------
     tgt_in_shuttle = st.frames.FramedVector(to_target_vec, phobosFrame).ExprIn(shuttleFrame)
     tgt_norm       = float(np.linalg.norm(tgt_in_shuttle))
     u_body         = tgt_in_shuttle / max(tgt_norm, 1e-6)
     cos_theta      = np.clip(float(u_body[0]), -1.0, 1.0)
     angle_err_deg  = np.rad2deg(np.arccos(cos_theta))
 
-    # ---- Predicted miss distance (only valid when moving) --------------------
+    # ---- Predicted Miss Distance ---------------------------------------------
     pred_miss_dist: float = 0.0
     if current_speed >= 2.0:
         vel_unit = vel / current_speed
-        # project target relative position onto velocity-perpendicular plane
         d_along = float(np.dot(to_target_vec, vel_unit))
         closest_approach = to_target_vec - d_along * vel_unit
         pred_miss_dist = float(np.linalg.norm(closest_approach))
 
     # ==========================================================================
-    # RADAR DEBRIS AVOIDANCE
+    # 1. OPTICAL CONTOUR SCAN (every CAM_CAPTURE_INTERVAL ticks)
     # ==========================================================================
-    repulsive_accel  = np.zeros(3)   # Phobos frame
-    n_threats        = 0
-    nearest_hazard_m = 999.0
+    cam_tick += 1
+    if cam_tick >= CAM_CAPTURE_INTERVAL:
+        cam_tick = 0
+        optical_contours_cache = run_optical_scan()
+
+    # ==========================================================================
+    # 2. RADAR & OPTICAL SENSOR FUSION APF
+    # ==========================================================================
+    repulsive_accel      = np.zeros(3)   # Phobos frame
+    n_threats            = 0
+    nearest_hazard_m     = 999.0
     radar_contacts_telem = []
+    forward_obs_telem    = []
+    fused_matches_telem  = []
+
+    CAM_RES = 128
+    cx_px = 64.0
+    cy_px = 64.0
+    focal_px = (CAM_RES * 0.5) / np.tan(np.deg2rad(60.0 * 0.5))  # ~110.85 px
 
     try:
         nearest_debris = GetNearestDebrisLocations(RADAR_N_CHECK)
@@ -268,80 +336,92 @@ while not exit_flag:
             d_closest    = float(d[1, 0])              # range to rock surface (m)
             closing_rate = float(d[1, 1])              # negative = approaching
             rock_diam    = float(d[1, 2])              # radar diameter (m)
-            rock_radius  = rock_diam / 2.0
+            rock_radius  = max(0.5, rock_diam / 2.0)
 
-            # Safety margin: account for noisy diameter + buffer
+            # Express in shuttle body frame
+            r_body = st.frames.FramedVector(r_vec, phobosFrame).ExprIn(shuttleFrame)
+            x_b, y_b, z_b = float(r_body[0]), float(r_body[1]), float(r_body[2])
+
+            radar_contacts_telem.append([x_b, y_b, rock_diam, closing_rate, z_b, d_closest, r_dist])
+
+            # Forward obstacles in flight path
+            if 1.0 < x_b < 150.0:
+                forward_obs_telem.append([x_b, y_b, z_b, rock_radius])
+
+            # SENSOR FUSION: Match forward radar obstacle with optical contours
+            if x_b > 2.0:
+                u_pred = cx_px + focal_px * (y_b / x_b)
+                v_pred = cy_px - focal_px * (z_b / x_b)
+
+                if 0.0 <= u_pred <= CAM_RES and 0.0 <= v_pred <= CAM_RES:
+                    best_match = None
+                    best_dist_px = 28.0
+                    for (ocx, ocy, area, eq_r) in optical_contours_cache:
+                        d_px = float(np.hypot(ocx - u_pred, ocy - v_pred))
+                        if d_px < best_dist_px:
+                            best_dist_px = d_px
+                            best_match = (ocx, ocy, eq_r)
+
+                    if best_match is not None:
+                        opt_cx, opt_cy, opt_r = best_match
+                        y_opt = (opt_cx - cx_px) * x_b / focal_px
+                        z_opt = -(opt_cy - cy_px) * x_b / focal_px
+                        fused_body = np.array([x_b, y_opt, z_opt])
+                        fused_phobos = np.array(st.frames.FramedVector(fused_body, shuttleFrame).ExprIn(phobosFrame))
+                        fused_matches_telem.append([
+                            float(u_pred), float(v_pred), float(opt_cx), float(opt_cy), float(x_b), float(rock_radius)
+                        ])
+                        # Refine obstacle vector using optical centroid
+                        r_vec = fused_phobos
+                        r_dist = float(np.linalg.norm(r_vec))
+
+            # Safety margin & threat calculation
             effective_clearance = d_closest - SAFE_CLEARANCE_M
-
             if d_closest < nearest_hazard_m:
                 nearest_hazard_m = d_closest
 
-            # Treat as threat if closing or slow (slow = can't track closing rate well)
             is_closing = (closing_rate < CLOSING_THRESHOLD) or (current_speed < 2.0)
-
             if effective_clearance < PROXIMITY_BUBBLE_M and is_closing:
                 n_threats += 1
-                # Repulsion direction: away from rock
                 n_away = -r_vec / max(r_dist, 1e-4)
-                # Remove component along target direction (preserve forward progress)
+                # Null-space lateral projection (preserves forward momentum)
                 n_lateral = n_away - np.dot(n_away, unit_to_target) * unit_to_target
                 lat_norm = float(np.linalg.norm(n_lateral))
                 if lat_norm > 1e-4:
                     n_lateral = n_lateral / lat_norm
                 else:
-                    n_lateral = n_away   # rock exactly on course — dodge sideways fully
+                    n_lateral = n_away
 
-                # Strength scales with proximity: 1.0 at surface, 0 at bubble edge
                 penetration = max(0.0, PROXIMITY_BUBBLE_M - effective_clearance) / PROXIMITY_BUBBLE_M
-                strength = REPULSION_GAIN * penetration * penetration
+                strength = REPULSION_GAIN * (penetration ** 2)
                 repulsive_accel += strength * n_lateral
-
-            # Build telemetry radar contacts list (body frame offset for dashboard)
-            r_body = st.frames.FramedVector(r_vec, phobosFrame).ExprIn(shuttleFrame)
-            radar_contacts_telem.append([float(r_body[0]), float(r_body[1]), rock_diam, closing_rate])
     except Exception:
         pass
 
     dodge_active = float(np.linalg.norm(repulsive_accel)) > 0.01
 
-    # Clamp repulsion magnitude
+    # Clamp repulsion acceleration
     rep_mag = float(np.linalg.norm(repulsive_accel))
     if rep_mag > MAX_ACCEL_CMD * 0.85:
         repulsive_accel = (MAX_ACCEL_CMD * 0.85 / rep_mag) * repulsive_accel
 
-    # ==========================================================================
-    # OPTICAL CONTOUR SCAN (every CAM_CAPTURE_INTERVAL ticks)
-    # ==========================================================================
-    cam_tick += 1
-    if cam_tick >= CAM_CAPTURE_INTERVAL:
-        cam_tick = 0
-        optical_contours_cache = run_optical_scan()
-
-    # Optical threat: large and centred contour → adds lateral push
+    # Optical direct threat backup
     optical_threat_accel = np.zeros(3)
     opt_threat_found = False
-    forward_obs_telem = []
-    for cnt_data in optical_contours_cache:
-        cx_off, cy_off, area, equiv_r = cnt_data
+    for (cx_val, cy_val, area, equiv_r) in optical_contours_cache:
+        cx_off = cx_val - cx_px
+        cy_off = cy_val - cy_px
         offset_px = float(np.hypot(cx_off, cy_off))
         if area > OPT_OPTICAL_THREAT_AREA_PX and offset_px < OPT_CENTER_THREAT_PX:
-            # Rock roughly ahead and large — push slightly perpendicular
-            # cx_off > 0 means rock is right of centre → push left (body -Y)
             push_body = np.array([0.0, -np.sign(cx_off) if abs(cx_off) > 2.0 else -1.0,
                                   -np.sign(cy_off) if abs(cy_off) > 2.0 else 0.0])
             push_phobos = np.array(st.frames.FramedVector(push_body, shuttleFrame).ExprIn(phobosFrame))
             optical_threat_accel += 0.08 * push_phobos
             opt_threat_found = True
-        # Build forward observation list for dashboard
-        forward_obs_telem.append([cx_off, cy_off, 0.0, equiv_r])
-
-    # Fused matches list (for dashboard)
-    fused_matches_telem = []
 
     # ==========================================================================
-    # TRANSLATIONAL GUIDANCE
+    # 3. TRANSLATIONAL GUIDANCE & THRUSTER COMMAND
     # ==========================================================================
-    # Phase logic
     if dist_to_target <= KEEP_OUT_RADIUS:
         current_phase = "WON"
     elif not boost_completed:
@@ -358,118 +438,91 @@ while not exit_flag:
         else:
             current_phase = "COAST"
 
-    # Track dodge transitions for recovery window
     if dodge_active and not dodge_active_prev:
-        recovery_counter = RECOVERY_TICKS   # start recovery timer when dodge begins
+        recovery_counter = RECOVERY_TICKS
     if not dodge_active and dodge_active_prev and recovery_counter <= 0:
-        recovery_counter = RECOVERY_TICKS   # also reset when dodge clears
+        recovery_counter = RECOVERY_TICKS
     if recovery_counter > 0:
         recovery_counter -= 1
     dodge_active_prev = dodge_active
 
-    # Compute linear acceleration command (Phobos frame)
     linearAccel_phobos = np.zeros(3)
 
     if current_phase == "WON":
         linearAccel_phobos = np.zeros(3)
 
     elif current_phase == "BOOST":
-        # Velocity error toward target at cruise speed
         goal_vel = CRUISE_SPEED * unit_to_target
         vel_err  = goal_vel - vel
-        a_cmd    = 1.0 * vel_err  # P-controller on velocity
-        # During early alignment, limit to 0.15 m/s^2 to not overshoot sideways
-        max_a = MAX_ACCEL_CMD if angle_err_deg < 20.0 else 0.15
+        a_cmd    = 1.0 * vel_err
+        # Smooth pad liftoff: 0.15 m/s^2 while pitching up, full thrust once aligned (< 18°)
+        max_a = MAX_ACCEL_CMD if angle_err_deg < 18.0 else 0.15
         a_mag = float(np.linalg.norm(a_cmd))
         if a_mag > max_a:
             a_cmd = (max_a / a_mag) * a_cmd
         linearAccel_phobos = a_cmd + repulsive_accel + optical_threat_accel
 
     elif current_phase in ("EVADE", "COAST-EVADE"):
-        # Apply repulsion only — no throttle (preserves fuel during coast)
+        # Apply repulsion maneuvers only (zero forward throttle during coast)
         linearAccel_phobos = repulsive_accel + optical_threat_accel
 
     elif current_phase == "RECOVER":
-        # Steer velocity back toward target bearing
         if current_speed >= 1.0:
             current_vel_unit = vel / current_speed
             bearing_err = unit_to_target - current_vel_unit
-            # Only correct if bearing error is significant (> ~3°)
             bearing_err_mag = float(np.linalg.norm(bearing_err))
             if bearing_err_mag > 0.05:
                 correct_dir = bearing_err / bearing_err_mag
-                # Soft correction proportional to bearing error, damp with angular velocity
                 correction_a = COURSE_CORRECTION_KP * current_speed * bearing_err_mag * correct_dir
                 corr_mag = float(np.linalg.norm(correction_a))
                 if corr_mag > 0.12:
                     correction_a = (0.12 / corr_mag) * correction_a
                 linearAccel_phobos = correction_a
-        # Still push away from any rocks even in recovery
         if dodge_active:
             linearAccel_phobos += repulsive_accel
 
-    else:  # COAST — pure ballistic, save all fuel
+    else:  # COAST
         linearAccel_phobos = np.zeros(3)
-        # Still dodge if something pops up
         if dodge_active or opt_threat_found:
             linearAccel_phobos = repulsive_accel + optical_threat_accel
             current_phase = "COAST-EVADE"
 
-    # Clamp total linear accel
     total_a_mag = float(np.linalg.norm(linearAccel_phobos))
     if total_a_mag > MAX_ACCEL_CMD:
         linearAccel_phobos = (MAX_ACCEL_CMD / total_a_mag) * linearAccel_phobos
 
-    # Express in shuttle body frame for the actuator
+    # Transform linear acceleration into shuttle body frame
     linearAcceleration = st.frames.FramedVector(linearAccel_phobos, phobosFrame).ExprIn(shuttleFrame)
 
     # ==========================================================================
-    # ATTITUDE CONTROL — 2-DOF pointing + roll damp
+    # 4. ATTITUDE CONTROL — 2-DOF Direct Pointing + Zero Roll Spin
     # ==========================================================================
-    # Deadband: relax thrusters when coasting and well aligned
-    attitude_deadband = (
-        current_phase in ("COAST",) and
-        angle_err_deg < 1.5 and
-        ang_speed < 0.008
-    )
-
-    if attitude_deadband:
+    if boost_completed and angle_err_deg < 1.0 and ang_speed < 0.005:
         angularAcceleration = np.zeros(3)
     else:
-        alpha_x = -kd_roll * float(current_AngVel[0])
-        alpha_y = -kp_point * float(u_body[2]) - kd_point * float(current_AngVel[1])
-        alpha_z =  kp_point * float(u_body[1]) - kd_point * float(current_AngVel[2])
+        # Zero roll rate, pitch and yaw directly driven by LOS error vector
+        alpha_x = -kd_roll * current_AngVel[0]
+        alpha_y = -kp_point * float(u_body[2]) - kd_point * current_AngVel[1]
+        alpha_z = kp_point * float(u_body[1]) - kd_point * current_AngVel[2]
         ang_acc = np.array([alpha_x, alpha_y, alpha_z])
-        ang_mag = float(np.linalg.norm(ang_acc))
-        if ang_mag > MAX_ANG_ACCEL:
-            ang_acc = (MAX_ANG_ACCEL / ang_mag) * ang_acc
+
+        ang_acc_mag = float(np.linalg.norm(ang_acc))
+        if ang_acc_mag > MAX_ANG_ACCEL:
+            ang_acc = (MAX_ANG_ACCEL / ang_acc_mag) * ang_acc
         angularAcceleration = ang_acc
 
-    # Send command
+    # DELIVER COMMAND TO ACTUATOR
     SetCommand(linearAcceleration, angularAcceleration)
 
     # ==========================================================================
-    # CAMERA GIMBAL — track cycler
-    # ==========================================================================
-    cam_body = st.frames.FramedVector(to_target_vec, phobosFrame).ExprIn(shuttleFrame)
-    cg_x = float(cam_body[0])
-    cg_y = float(cam_body[1])
-    cg_z = float(cam_body[2])
-    if cg_x > 1.0:
-        cam_yaw   = float(np.clip(np.rad2deg(np.arctan2(cg_y, cg_x)), -85.0, 85.0))
-        cam_pitch = float(np.clip(np.rad2deg(np.arctan2(-cg_z, np.hypot(cg_x, cg_y))), -50.0, 0.0))
-        PanTiltCamera(topCamera, cam_yaw, cam_pitch)
-        PanTiltCamera(bottomCamera, cam_yaw, 0.0)
-
-    # ==========================================================================
-    # TELEMETRY — full LiveDashboard compatible output
+    # 5. TELEMETRY & LOGGING
     # ==========================================================================
     if iteration % log_interval == 0:
         msg = (
-            f"[{current_phase}] T={t_from_start:.1f}s|Dist={dist_to_target:.1f}m|"
-            f"Miss={pred_miss_dist:.1f}m|Spd={current_speed:.2f}m/s|"
-            f"Threats={n_threats}|Dmg={damage_taken:.0f}J|"
-            f"Fuel={fuel_used:.3f}kg/{NOMINAL_FUEL_KG}kg"
+            f"[{current_phase}] T={t_from_start:.1f}s | Dist={dist_to_target:.1f}m | "
+            f"Miss={pred_miss_dist:.1f}m | Spd={current_speed:.2f}m/s | "
+            f"Threats={n_threats} | Dmg={damage_taken:.0f}J | "
+            f"Fuel={fuel_used:.2f}kg/{NOMINAL_FUEL_KG}kg"
         )
         st.OnScreenLogMessage(msg, "Autopilot", st.Severity.Info)
 
@@ -490,10 +543,10 @@ while not exit_flag:
             "target_x":         float(target_loc[0]),
             "target_z":         float(target_loc[2]),
             "rep_body":         rep_body_list,
-            "radar_contacts":   radar_contacts_telem[:20],
-            "forward_obs":      forward_obs_telem[:10],
-            "optical_contours": [[c[0], c[1], c[2], c[3]] for c in optical_contours_cache[:10]],
-            "fused_matches":    fused_matches_telem,
+            "radar_contacts":   radar_contacts_telem[:100],
+            "forward_obs":      forward_obs_telem[:16],
+            "optical_contours": [[c[0], c[1], c[2], c[3]] for c in optical_contours_cache[:16]],
+            "fused_matches":    fused_matches_telem[:12],
         }
         try:
             with open(telemetry_path, "w", encoding="utf-8") as tf:
@@ -506,13 +559,15 @@ while not exit_flag:
         except Exception:
             pass
 
-    
+    # ==========================================================================
+    # 6. VICTORY CHECK
+    # ==========================================================================
     if dist_to_target <= KEEP_OUT_RADIUS:
         if not win_registered:
             win_registered = True
             st.OnScreenAlert(
-                f"[VICTORY] Dist={dist_to_target:.2f}m | T={t_from_start:.2f}s | "
-                f"Fuel={fuel_used:.2f}kg | Dmg={damage_taken:.0f}J",
+                f"[VICTORY ACHIEVED] Dist={dist_to_target:.2f}m <= 50m! Arrival Time={t_from_start:.2f}s | "
+                f"Fuel Used={fuel_used:.2f}kg | Damage={damage_taken:.0f}J",
                 "Victory",
                 st.Severity.Warning
             )
